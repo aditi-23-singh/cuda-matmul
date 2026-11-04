@@ -1,0 +1,7 @@
+matmul
+matmul.exe
+*.o
+*.ncu-rep
+__pycache__/
+*.exp
+*.lib
