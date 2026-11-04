@@ -41,15 +41,29 @@ Timing uses CUDA events around the kernel only (after one warm-up launch), so ho
 
 ## Results
 
-> Fill this table in from **your own** `bench.py` output. Don't put numbers here or on the resume that you did not measure.
+Measured on an NVIDIA GeForce RTX 3050 6GB Laptop GPU (20 SMs, CC 8.6), plugged in. Median of 3 runs × 10 launches, from `python bench.py`. All kernels passed verification at N = 127, 256 and 1000 against the CPU result and a NumPy float64 reference (max relative error ≤ 1.3e-6).
 
-| Kernel | N=1024 ms | N=1024 GFLOP/s | N=4096 GFLOP/s | % of cuBLAS (N=4096) |
-|---|---|---|---|---|
-| CPU | | | — | — |
-| naive | | | | |
-| coalesced | | | | |
-| tiled (best tile) | | | | |
-| cuBLAS | | | | 100% |
+| Kernel | N=1024 ms | N=1024 GFLOP/s | vs naive (1024) | N=4096 GFLOP/s | % of cuBLAS (4096) |
+|---|---|---|---|---|---|
+| CPU (1 thread) | 124.76 | 17.2 | — | skipped | — |
+| naive | 33.03 | 65.0 | 1.0× | 65.1 | 1.8% |
+| coalesced | 4.48 | 479.4 | 7.4× | 397.8 | 10.8% |
+| tiled, TILE=16 | 3.18 | **675.7** | **10.4×** | 488.4 | 13.3% |
+| tiled, TILE=32 | 3.80 | 564.8 | 8.7× | **530.3** | **14.4%** |
+| cuBLAS | 0.44 | 4929.9 | 75.8× | 3678.2 | 100% |
+
+Highest speedup over the single-threaded CPU: **65×** (tiled, TILE=32, N=2048). Full data in `results/results.csv`; plots in `results/gflops_vs_n.png` and `results/tile_sweep.png`.
+
+N=4096 numbers (including cuBLAS) are lower than at 1024–2048 because the laptop GPU throttles under sustained load; compare kernels within the same N, not across sizes.
+
+**Tile-size sweep (GFLOP/s):**
+
+| N | TILE=8 | TILE=16 | TILE=32 |
+|---|---|---|---|
+| 256 | 407 | **524** | 440 |
+| 1024 | 479 | **676** | 565 |
+| 2048 | 350 | 600 | **610** |
+| 4096 | 270 | 488 | **530** |
 
 ## Why each step is faster
 
@@ -66,7 +80,16 @@ v2 still does 2 global loads per multiply-add, so arithmetic intensity is about 
 - Out-of-range elements are loaded as 0, so any N works.
 
 ### Tile size trade-off
-Bigger tiles mean more reuse but more threads and shared memory per block, which can reduce how many blocks fit on an SM (occupancy). TILE=8 gives 64-thread blocks (only 2 warps each), which is poor for latency hiding. Compare 16 vs 32 in your own sweep and explain the result with occupancy and reuse.
+The best tile size changes with N, because two effects pull in opposite directions:
+
+- **Occupancy favours TILE=16.** An SM on this GPU holds at most 1536 threads. A 32×32 block is 1024 threads, so only 1 block fits (32 of 48 warps, 67% occupancy). 16×16 blocks are 256 threads, so up to 6 fit (48 warps, 100%), giving the scheduler more warps to hide latency with. This wins at small and medium N (TILE=16 is 20% faster at N=1024).
+- **Data reuse favours TILE=32.** Each element loaded from global memory is reused TILE times, so TILE=32 moves half the global/L2 traffic of TILE=16. At N=2048 the two are tied, and at N=4096, where the working set is far larger than the 2 MB L2, the lower traffic wins (TILE=32 is 9% faster).
+- **TILE=8 loses at every size from N=1024 up, and is even slower than the untiled coalesced kernel.** 64-thread blocks run into the per-SM block limit, reuse is only 8×, and there are 4× more `__syncthreads()` per unit of work.
+
+### Why tiling gives only about 1.3× over coalesced
+Shared-memory tiling cuts DRAM traffic by about TILE×, but the speedup over the coalesced kernel is only 1.2–1.4× at every size. Two reasons:
+1. **Hardware caches already capture much of the reuse.** In the coalesced kernel all threads of a warp read the same `A` element (a broadcast), and neighbouring blocks read the same rows of `B`, so L1/L2 serve much of that traffic.
+2. **The tiled kernel is now bound by shared-memory loads.** Its inner loop issues 2 shared-memory loads per fused multiply-add, so load instructions, not DRAM bandwidth, limit throughput. The next step is register tiling (below).
 
 ### Why cuBLAS is still much faster
 cuBLAS uses **register tiling** (each thread computes a 4×4 or 8×8 patch of C, so values are reused from registers, not just shared memory), vectorized `float4` loads, double-buffered shared memory so loads for the next tile overlap with compute on the current one, and hand-tuned kernels picked per GPU and per matrix shape. Tensor cores are not used here because TF32 is disabled.
